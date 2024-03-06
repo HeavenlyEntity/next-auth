@@ -1,6 +1,6 @@
 /**
  * <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", padding: 16}}>
- *  <p style={{fontWeight: "normal"}}>Official <a href="https://www.prisma.io/docs">Prisma</a> adapter for Auth.js / NextAuth.js.</p>
+ *  Official <a href="https://www.prisma.io/docs">Prisma</a> adapter for Auth.js / NextAuth.js.
  *  <a href="https://www.prisma.io/">
  *   <img style={{display: "block"}} src="https://authjs.dev/img/adapters/prisma.svg" width="38" />
  *  </a>
@@ -8,47 +8,48 @@
  *
  * ## Installation
  *
- * ```bash npm2yarn2pnpm
- * npm install next-auth @prisma/client @next-auth/prisma-adapter
+ * ```bash npm2yarn
+ * npm install @prisma/client @auth/prisma-adapter
  * npm install prisma --save-dev
  * ```
  *
- * @module @next-auth/prisma-adapter
+ * @module @auth/prisma-adapter
  */
 import type { PrismaClient, Prisma } from "@prisma/client"
-import type { Adapter, AdapterAccount } from "next-auth/adapters"
+import type {
+  Adapter,
+  AdapterAccount,
+  AdapterAuthenticator,
+  AdapterSession,
+  AdapterUser,
+} from "@auth/core/adapters"
 
 /**
  * ## Setup
  *
- * Add this adapter to your `pages/api/[...nextauth].js` next-auth configuration object:
+ * Add this adapter to your `auth.ts` Auth.js configuration object:
  *
- * ```js title="pages/api/auth/[...nextauth].js"
+ * ```js title="auth.ts"
  * import NextAuth from "next-auth"
- * import GoogleProvider from "next-auth/providers/google"
- * import { PrismaAdapter } from "@next-auth/prisma-adapter"
+ * import Google from "next-auth/providers/google"
+ * import { PrismaAdapter } from "@auth/prisma-adapter"
  * import { PrismaClient } from "@prisma/client"
  *
  * const prisma = new PrismaClient()
  *
- * export default NextAuth({
+ * export const { handlers, auth, signIn, signOut } = NextAuth({
  *   adapter: PrismaAdapter(prisma),
  *   providers: [
- *     GoogleProvider({
- *       clientId: process.env.GOOGLE_CLIENT_ID,
- *       clientSecret: process.env.GOOGLE_CLIENT_SECRET,
- *     }),
+ *     Google,
  *   ],
  * })
  * ```
- *
- * ## Advanced usage
  *
  * ### Create the Prisma schema from scratch
  *
  * You need to use at least Prisma 2.26.0. Create a schema file in `prisma/schema.prisma` similar to this one:
  *
- * > This schema is adapted for use in Prisma and based upon our main [schema](https://authjs.dev/reference/adapters#models)
+ * > This schema is adapted for use in Prisma and based upon our main [schema](https://authjs.dev/reference/core/adapters#models)
  *
  * ```json title="schema.prisma"
  * datasource db {
@@ -217,12 +218,32 @@ import type { Adapter, AdapterAccount } from "next-auth/adapters"
  *   @@unique([identifier, token])
  *   @@map("verificationtokens")
  * }
+ *
+ * model Authenticator {
+ *   id                   String  @id @default(cuid())
+ *   credentialID         String  @unique
+ *   userId               String
+ *   providerAccountId    String
+ *   credentialPublicKey  String
+ *   counter              Int
+ *   credentialDeviceType String
+ *   credentialBackedUp   Boolean
+ *   transports           String?
+ *
+ *   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+ * }
  * ```
  *
  **/
-export function PrismaAdapter(p: PrismaClient): Adapter {
+export function PrismaAdapter(
+  prisma: PrismaClient | ReturnType<PrismaClient["$extends"]>
+): Adapter {
+  const p = prisma as PrismaClient
   return {
-    createUser: (data) => p.user.create({ data }),
+    // We need to let Prisma generate the ID because our default UUID is incompatible with MongoDB
+    createUser: ({ id: _id, ...data }) => {
+      return p.user.create({ data })
+    },
     getUser: (id) => p.user.findUnique({ where: { id } }),
     getUserByEmail: (email) => p.user.findUnique({ where: { email } }),
     async getUserByAccount(provider_providerAccountId) {
@@ -230,10 +251,12 @@ export function PrismaAdapter(p: PrismaClient): Adapter {
         where: { provider_providerAccountId },
         select: { user: true },
       })
-      return account?.user ?? null
+      return (account?.user as AdapterUser) ?? null
     },
-    updateUser: ({ id, ...data }) => p.user.update({ where: { id }, data }),
-    deleteUser: (id) => p.user.delete({ where: { id } }),
+    updateUser: ({ id, ...data }) =>
+      p.user.update({ where: { id }, data }) as Promise<AdapterUser>,
+    deleteUser: (id) =>
+      p.user.delete({ where: { id } }) as Promise<AdapterUser>,
     linkAccount: (data) =>
       p.account.create({ data }) as unknown as AdapterAccount,
     unlinkAccount: (provider_providerAccountId) =>
@@ -247,7 +270,7 @@ export function PrismaAdapter(p: PrismaClient): Adapter {
       })
       if (!userAndSession) return null
       const { user, ...session } = userAndSession
-      return { user, session }
+      return { user, session } as { user: AdapterUser; session: AdapterSession }
     },
     createSession: (data) => p.session.create({ data }),
     updateSession: (data) =>
@@ -276,5 +299,55 @@ export function PrismaAdapter(p: PrismaClient): Adapter {
         throw error
       }
     },
+    async getAccount(providerAccountId, provider) {
+      return p.account.findFirst({
+        where: { providerAccountId, provider },
+      }) as Promise<AdapterAccount | null>
+    },
+    async createAuthenticator(authenticator) {
+      return p.authenticator
+        .create({
+          data: authenticator,
+        })
+        .then(fromDBAuthenticator)
+    },
+    async getAuthenticator(credentialID) {
+      const authenticator = await p.authenticator.findUnique({
+        where: { credentialID },
+      })
+      return authenticator ? fromDBAuthenticator(authenticator) : null
+    },
+    async listAuthenticatorsByUserId(userId) {
+      const authenticators = await p.authenticator.findMany({
+        where: { userId },
+      })
+
+      return authenticators.map(fromDBAuthenticator)
+    },
+    async updateAuthenticatorCounter(credentialID, counter) {
+      return p.authenticator
+        .update({
+          where: { credentialID: credentialID },
+          data: { counter },
+        })
+        .then(fromDBAuthenticator)
+    },
+  }
+}
+
+type BasePrismaAuthenticator = Parameters<
+  PrismaClient["authenticator"]["create"]
+>[0]["data"]
+type PrismaAuthenticator = BasePrismaAuthenticator &
+  Required<Pick<BasePrismaAuthenticator, "userId">>
+
+function fromDBAuthenticator(
+  authenticator: PrismaAuthenticator
+): AdapterAuthenticator {
+  const { transports, id, user, ...other } = authenticator
+
+  return {
+    ...other,
+    transports: transports || undefined,
   }
 }

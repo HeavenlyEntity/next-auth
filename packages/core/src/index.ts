@@ -13,7 +13,7 @@
  *
  * ## Installation
  *
- * ```bash npm2yarn2pnpm
+ * ```bash npm2yarn
  * npm install @auth/core
  * ```
  *
@@ -33,28 +33,47 @@
  * - [Getting started](https://authjs.dev/getting-started/introduction)
  * - [Most common use case guides](https://authjs.dev/guides)
  *
- * @module index
+ * @module @auth/core
  */
 
-import { assertConfig } from "./lib/assert.js"
-import { ErrorPageLoop } from "./errors.js"
-import { AuthInternal, skipCSRFCheck } from "./lib/index.js"
+import { assertConfig } from "./lib/utils/assert.js"
+import {
+  AuthError,
+  CredentialsSignin,
+  ErrorPageLoop,
+  isClientError,
+} from "./errors.js"
+import { AuthInternal, raw, skipCSRFCheck } from "./lib/index.js"
+import { setEnvDefaults, createActionURL } from "./lib/utils/env.js"
 import renderPage from "./lib/pages/index.js"
 import { logger, setLogger, type LoggerInstance } from "./lib/utils/logger.js"
-import { toInternalRequest, toResponse } from "./lib/web.js"
+import { toInternalRequest, toResponse } from "./lib/utils/web.js"
 
 import type { Adapter } from "./adapters.js"
 import type {
+  AuthAction,
   CallbacksOptions,
   CookiesOptions,
   EventCallbacks,
   PagesOptions,
+  ResponseInternal,
   Theme,
 } from "./types.js"
 import type { Provider } from "./providers/index.js"
 import { JWTOptions } from "./jwt.js"
+import { isAuthAction } from "./lib/utils/actions.js"
 
-export { skipCSRFCheck }
+export { skipCSRFCheck, raw, setEnvDefaults, createActionURL, isAuthAction }
+
+export async function Auth(
+  request: Request,
+  config: AuthConfig & { raw: typeof raw }
+): Promise<ResponseInternal>
+
+export async function Auth(
+  request: Request,
+  config: Omit<AuthConfig, "raw">
+): Promise<Response>
 
 /**
  * Core functionality provided by Auth.js.
@@ -77,48 +96,46 @@ export { skipCSRFCheck }
 export async function Auth(
   request: Request,
   config: AuthConfig
-): Promise<Response> {
+): Promise<Response | ResponseInternal> {
   setLogger(config.logger, config.debug)
 
-  const internalRequest = await toInternalRequest(request)
-  if (internalRequest instanceof Error) {
-    logger.error(internalRequest)
-    return new Response(
-      `Error: This action with HTTP ${request.method} is not supported.`,
-      { status: 400 }
-    )
-  }
+  const internalRequest = await toInternalRequest(request, config)
+  // There was an error parsing the request
+  if (!internalRequest) return Response.json(`Bad request.`, { status: 400 })
 
-  const assertionResult = assertConfig(internalRequest, config)
+  const warningsOrError = assertConfig(internalRequest, config)
 
-  if (Array.isArray(assertionResult)) {
-    assertionResult.forEach(logger.warn)
-  } else if (assertionResult instanceof Error) {
-    // Bail out early if there's an error in the user config
-    logger.error(assertionResult)
-    const htmlPages = ["signin", "signout", "error", "verify-request"]
+  if (Array.isArray(warningsOrError)) {
+    warningsOrError.forEach(logger.warn)
+  } else if (warningsOrError) {
+    // If there's an error in the user config, bail out early
+    logger.error(warningsOrError)
+    const htmlPages = new Set<AuthAction>([
+      "signin",
+      "signout",
+      "error",
+      "verify-request",
+    ])
     if (
-      !htmlPages.includes(internalRequest.action) ||
+      !htmlPages.has(internalRequest.action) ||
       internalRequest.method !== "GET"
     ) {
-      return new Response(
-        JSON.stringify({
-          message:
-            "There was a problem with the server configuration. Check the server logs for more information.",
-          code: assertionResult.name,
-        }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
-      )
+      const message =
+        "There was a problem with the server configuration. Check the server logs for more information."
+      return Response.json({ message }, { status: 500 })
     }
 
     const { pages, theme } = config
 
+    // If this is true, the config required auth on the error page
+    // which could cause a redirect loop
     const authOnErrorPage =
       pages?.error &&
       internalRequest.url.searchParams
         .get("callbackUrl")
         ?.startsWith(pages.error)
 
+    // Either there was no error page configured or the configured one contains infinite redirects
     if (!pages?.error || authOnErrorPage) {
       if (authOnErrorPage) {
         logger.error(
@@ -127,29 +144,51 @@ export async function Auth(
           )
         )
       }
-      const render = renderPage({ theme })
-      const page = render.error({ error: "Configuration" })
+
+      const page = renderPage({ theme }).error("Configuration")
       return toResponse(page)
     }
 
     return Response.redirect(`${pages.error}?error=Configuration`)
   }
 
-  const internalResponse = await AuthInternal(internalRequest, config)
+  const isRedirect = request.headers?.has("X-Auth-Return-Redirect")
+  const isRaw = config.raw === raw
+  try {
+    const internalResponse = await AuthInternal(internalRequest, config)
+    if (isRaw) return internalResponse
 
-  const response = await toResponse(internalResponse)
+    const response = toResponse(internalResponse)
+    const url = response.headers.get("Location")
 
-  // If the request expects a return URL, send it as JSON
-  // instead of doing an actual redirect.
-  const redirect = response.headers.get("Location")
-  if (request.headers.has("X-Auth-Return-Redirect") && redirect) {
-    response.headers.delete("Location")
-    response.headers.set("Content-Type", "application/json")
-    return new Response(JSON.stringify({ url: redirect }), {
-      headers: response.headers,
-    })
+    if (!isRedirect || !url) return response
+
+    return Response.json({ url }, { headers: response.headers })
+  } catch (e) {
+    const error = e as Error
+    logger.error(error)
+
+    const isAuthError = error instanceof AuthError
+    if (isAuthError && isRaw && !isRedirect) throw error
+
+    // If the CSRF check failed for POST/session, return a 400 status code.
+    // We should not redirect to a page as this is an API route
+    if (request.method === "POST" && internalRequest.action === "session")
+      return Response.json(null, { status: 400 })
+
+    const isClientSafeErrorType = isClientError(error)
+    const type = isClientSafeErrorType ? error.type : "Configuration"
+
+    const params = new URLSearchParams({ error: type })
+    if (error instanceof CredentialsSignin) params.set("code", error.code)
+
+    const pageKind = (isAuthError && error.kind) || "error"
+    const pagePath = config.pages?.[pageKind] ?? `/${pageKind.toLowerCase()}`
+    const url = `${internalRequest.url.origin}${config.basePath}${pagePath}?${params}`
+
+    if (isRedirect) return Response.json({ url })
+    return Response.redirect(url)
   }
-  return response
 }
 
 /**
@@ -178,13 +217,16 @@ export interface AuthConfig {
   providers: Provider[]
   /**
    * A random string used to hash tokens, sign cookies and generate cryptographic keys.
-   * If not specified, it falls back to `AUTH_SECRET` or `NEXTAUTH_SECRET` from environment variables.
-   * To generate a random string, you can use the following command:
    *
-   * - On Unix systems, type `openssl rand -hex 32` in the terminal
-   * - Or generate one [online](https://generate-secret.vercel.app/32)
+   * To generate a random string, you can use the Auth.js CLI: `npx auth secret`
+   *
+   * @note
+   * You can also pass an array of secrets, in which case the first secret that successfully
+   * decrypts the JWT will be used. This is useful for rotating secrets without invalidating existing sessions.
+   * The newer secret should be added to the start of the array, which will be used for all new sessions.
+   *
    */
-  secret?: string
+  secret?: string | string[]
   /**
    * Configure your session like if you want to use JWT or a database,
    * how long until an idle session expires, or to throttle write operations in case you are using a database.
@@ -200,7 +242,7 @@ export interface AuthConfig {
      * When using `"database"`, the session cookie will only contain a `sessionToken` value,
      * which is used to look up the session in the database.
      *
-     * [Documentation](https://authjs.dev/reference/configuration/auth-config#session) | [Adapter](https://authjs.dev/reference/configuration/auth-config#adapter) | [About JSON Web Tokens](https://authjs.dev/reference/faq#json-web-tokens)
+     * [Documentation](https://authjs.dev/reference/core#authconfig#session) | [Adapter](https://authjs.dev/reference/core#authconfig#adapter) | [About JSON Web Tokens](https://authjs.dev/reference/faq#json-web-tokens)
      */
     strategy?: "jwt" | "database"
     /**
@@ -282,9 +324,10 @@ export interface AuthConfig {
    * @example
    *
    * ```ts
-   * // /pages/api/auth/[...nextauth].js
+   * // /auth.ts
    * import log from "logging-service"
-   * export default NextAuth({
+   *
+   * export const { handlers, auth, signIn, signOut } = NextAuth({
    *   logger: {
    *     error(code, ...message) {
    *       log.error(code, message)
@@ -320,9 +363,9 @@ export interface AuthConfig {
    */
   useSecureCookies?: boolean
   /**
-   * You can override the default cookie names and options for any of the cookies used by NextAuth.js.
-   * You can specify one or more cookies with custom properties,
-   * but if you specify custom options for a cookie you must provide all the options for that cookie.
+   * You can override the default cookie names and options for any of the cookies used by Auth.js.
+   * You can specify one or more cookies with custom properties
+   * and missing options will use the default values defined by Auth.js.
    * If you use this feature, you will likely want to create conditional behavior
    * to support setting different cookies policies in development and production builds,
    * as you will be opting out of the built-in dynamic policy.
@@ -334,7 +377,69 @@ export interface AuthConfig {
    * @default {}
    */
   cookies?: Partial<CookiesOptions>
-  /** @todo */
+  /**
+   * Auth.js relies on the incoming request's `host` header to function correctly. For this reason this property needs to be set to `true`.
+   *
+   * Make sure that your deployment platform sets the `host` header safely.
+   *
+   * :::note
+   * Official Auth.js-based libraries will attempt to set this value automatically for some deployment platforms (eg.: Vercel) that are known to set the `host` header safely.
+   * :::
+   */
   trustHost?: boolean
   skipCSRFCheck?: typeof skipCSRFCheck
+  raw?: typeof raw
+  /**
+   * When set, during an OAuth sign-in flow,
+   * the `redirect_uri` of the authorization request
+   * will be set based on this value.
+   *
+   * This is useful if your OAuth Provider only supports a single `redirect_uri`
+   * or you want to use OAuth on preview URLs (like Vercel), where you don't know the final deployment URL beforehand.
+   *
+   * The url needs to include the full path up to where Auth.js is initialized.
+   *
+   * @note This will auto-enable the `state` {@link OAuth2Config.checks} on the provider.
+   *
+   * @example
+   * ```
+   * "https://authjs.example.com/api/auth"
+   * ```
+   *
+   * You can also override this individually for each provider.
+   *
+   * @example
+   * ```ts
+   * GitHub({
+   *   ...
+   *   redirectProxyUrl: "https://github.example.com/api/auth"
+   * })
+   * ```
+   *
+   * @default `AUTH_REDIRECT_PROXY_URL` environment variable
+   *
+   * See also: [Guide: Securing a Preview Deployment](https://authjs.dev/getting-started/deployment#securing-a-preview-deployment)
+   */
+  redirectProxyUrl?: string
+
+  /**
+   * Use this option to enable experimental features.
+   * When enabled, it will print a warning message to the console.
+   * @note Experimental features are not guaranteed to be stable and may change or be removed without notice. Please use with caution.
+   * @default {}
+   */
+  experimental?: {
+    /**
+     * Enable WebAuthn support.
+     *
+     * @default false
+     */
+    enableWebAuthn?: boolean
+  }
+  /**
+   * The base path of the Auth.js API endpoints.
+   *
+   * @default "/auth"
+   */
+  basePath?: string
 }
